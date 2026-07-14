@@ -9,21 +9,27 @@ app.use(express.json());
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
+// 1. 라이선스 검증 API
+app.post("/api/verify", async (req, res) => {
+  const { licenseKey } = req.body;
+  if (!licenseKey) return res.status(400).json({ error: "키가 없습니다." });
+  try {
+    const { data: license, error } = await supabase.from("licenses").select("*").eq("license_key", licenseKey).single();
+    if (error || !license) return res.status(401).json({ error: "유효하지 않은 키" });
+    return res.json({ success: true, limit: license.daily_limit, used: license.used_chars || 0, role: license.role || 'user' });
+  } catch (err) { return res.status(500).json({ error: err.message }); }
+});
+
+// 2. 앙상블 탐지 API
 app.post("/api/detect", async (req, res) => {
   const { text, licenseKey } = req.body;
-  if (!text || !licenseKey) return res.status(400).json({ error: "데이터 누락" });
-
   try {
     const { data: license } = await supabase.from("licenses").select("*").eq("license_key", licenseKey).single();
-    if (!license) return res.status(401).json({ error: "Invalid Key" });
+    if (!license) return res.status(401).json({ error: "유효하지 않은 키" });
 
-    // 통계 분석용 프롬프트
-    const prompt = `당신은 언어 통계학자입니다. 텍스트를 분석하여 AI 작성 확률(0-100)을 산출하십시오.
-    [기준: Perplexity(혼란도)와 Burstiness(변칙성) 분석]
-    설명 생략, 오직 0-100 사이의 숫자 하나만 출력하십시오.
-    텍스트: """${text}"""`;
+    const prompt = `당신은 언어 통계학자입니다. 텍스트의 Perplexity(혼란도)와 Burstiness(변칙성)를 분석하여 AI 작성 확률(0-100)을 산출하십시오. 숫자 하나만 출력하십시오. 텍스트: """${text}"""`;
 
-    // 1. Gemini 3.5 Flash & Groq Llama 3.3 동시 호출
+    // Gemini 3.5 & Groq 앙상블
     const [geminiRes, groqRes] = await Promise.all([
       fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`, {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -36,19 +42,16 @@ app.post("/api/detect", async (req, res) => {
       }).then(r => r.json())
     ]);
 
-    // 2. 결과 파싱 및 평균 계산
     const geminiScore = parseInt(geminiRes.candidates[0].content.parts[0].text.replace(/[^0-9]/g, '')) || 0;
     const groqScore = parseInt(groqRes.choices[0].message.content.replace(/[^0-9]/g, '')) || 0;
-    
     const finalScore = Math.round((geminiScore + groqScore) / 2);
 
     await supabase.from("licenses").update({ used_chars: license.used_chars + text.length }).eq("license_key", licenseKey);
-    
     return res.json({ success: true, aiScore: finalScore });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "탐지 실패" });
+    return res.status(500).json({ error: "탐지 서버 오류" });
   }
 });
 
-app.listen(3000, () => console.log("Ensemble Server Running"));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Server Active"));
