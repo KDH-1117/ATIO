@@ -50,14 +50,13 @@ app.post("/api/detect", async (req, res) => {
     const used = license.used_chars || 0;
     const role = license.role || 'user';
 
-    // 🚨 한도 차감 제어: 어드민이 아닐 때만 글자 수 초과 검사
+    // 한도 차감 제어: 어드민이 아닐 때만 글자 수 초과 검사
     if (role !== "admin" && (used + charCount > limit)) {
       return res.status(403).json({ error: "일일 글자 수 한도가 초과되었습니다." });
     }
 
     let aiScore = 0;
 
-    // 수학적 기준(Perplexity, Burstiness)을 주입하여 정확도를 극대화한 프롬프트
     const prompt = `당신은 세계 최고 수준의 AI 텍스트 탐지 전문가입니다. 아래 한국어 텍스트를 분석하여 AI(ChatGPT, Claude 등)가 작성했을 확률을 0부터 100 사이의 정수(%)로 평가하세요.
     
     [채점 기준]
@@ -68,9 +67,9 @@ app.post("/api/detect", async (req, res) => {
     위 기준을 엄격하게 적용하여 오직 0에서 100 사이의 숫자 하나만 출력하세요. 설명, 기호(%) 등 다른 텍스트는 절대 포함하지 마세요.
     텍스트: """${text}"""`;
 
-    // 1. Google Gemini
+    // 1. Google Gemini (최신 2.5 flash 모델로 교체)
     if (model === "gemini") {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
       });
@@ -78,11 +77,11 @@ app.post("/api/detect", async (req, res) => {
       if (result.error) return res.status(400).json({ error: `Gemini 오류: ${result.error.message}` });
       aiScore = parseInt(result.candidates[0].content.parts[0].text.replace(/[^0-9]/g, '')) || 0;
     } 
-    // 2. Groq Llama 3
+    // 2. Groq Llama 3 (최신 3.3 70b 모델로 교체)
     else if (model === "groq") {
       const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST", headers: { "Authorization": `Bearer ${process.env.GROQ_API_KEY}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "llama3-70b-8192", messages: [{ role: "user", content: prompt }] })
+        body: JSON.stringify({ model: "llama-3.3-70b-versatile", messages: [{ role: "user", content: prompt }] })
       });
       const result = await response.json();
       if (result.error) return res.status(400).json({ error: `Groq 오류: ${result.error.message}` });
@@ -91,7 +90,7 @@ app.post("/api/detect", async (req, res) => {
 
     aiScore = Math.min(100, Math.max(0, aiScore)); 
     
-    // 검사 성공 시 DB 사용량 업데이트 (어드민이든 유저든 누적 사용량은 기록함)
+    // 검사 성공 시 DB 사용량 업데이트
     await supabase.from("licenses").update({ used_chars: used + charCount }).eq("license_key", licenseKey);
     return res.json({ success: true, aiScore, usedChars: used + charCount, dailyLimit: limit });
 
