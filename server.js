@@ -7,14 +7,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 1. Supabase 데이터베이스 연결 (환경 변수에서 가져옴)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// 2. 검사 요청을 처리하는 API 엔드포인트
-// [새로 추가할 부분] 로그인 시 라이선스가 진짜인지 확인하는 기능
+// 라이선스 검증 기능
 app.post("/api/verify", async (req, res) => {
   const { licenseKey } = req.body;
-  if (!licenseKey) return res.status(400).json({ error: "License key is required." });
+  if (!licenseKey) return res.status(400).json({ error: "라이선스 키가 필요합니다." });
 
   try {
     const { data: license, error } = await supabase
@@ -23,19 +21,15 @@ app.post("/api/verify", async (req, res) => {
       .eq("license_key", licenseKey)
       .single();
 
-    if (error || !license) {
-      return res.status(401).json({ error: "Invalid license key." });
-    }
+    if (error || !license) return res.status(401).json({ error: "유효하지 않은 라이선스 키입니다." });
 
-    return res.json({
-      success: true,
-      limit: license.daily_limit,
-      used: license.used_chars || 0
-    });
+    return res.json({ success: true, limit: license.daily_limit, used: license.used_chars || 0 });
   } catch (err) {
-    return res.status(500).json({ error: "Server error." });
+    return res.status(500).json({ error: "서버 에러가 발생했습니다." });
   }
 });
+
+// AI 검사 기능 (에러 처리 완벽 수정)
 app.post("/api/detect", async (req, res) => {
   const { text, licenseKey, model } = req.body;
 
@@ -46,7 +40,6 @@ app.post("/api/detect", async (req, res) => {
   const charCount = text.length;
 
   try {
-    // [DB 확인] 라이선스 키 조회
     const { data: license, error } = await supabase
       .from("licenses")
       .select("*")
@@ -55,7 +48,6 @@ app.post("/api/detect", async (req, res) => {
 
     if (error || !license) return res.status(401).json({ error: "유효하지 않은 라이선스 키입니다." });
 
-    // [한도 확인] 글자 수 차감 계산
     const limit = license.daily_limit;
     const used = license.used_chars || 0;
 
@@ -65,7 +57,6 @@ app.post("/api/detect", async (req, res) => {
 
     let aiScore = 0;
 
-    // [AI 호출] Sapling 또는 Hugging Face 선택 호출
     if (model === "sapling") {
       const response = await fetch("https://api.sapling.ai/api/v1/aidetect", {
         method: "POST",
@@ -76,6 +67,11 @@ app.post("/api/detect", async (req, res) => {
         })
       });
       const result = await response.json();
+
+      // [핵심 수정] Sapling에서 에러를 뱉으면 0%로 무시하지 않고 프론트로 에러 전달
+      if (!response.ok || result.error || result.msg) {
+         return res.status(400).json({ error: `Sapling 오류: ${result.error || result.msg || response.statusText}` });
+      }
       aiScore = Math.round((result.score || 0) * 100);
     } 
     else if (model === "huggingface") {
@@ -85,21 +81,26 @@ app.post("/api/detect", async (req, res) => {
         body: JSON.stringify({ inputs: text }),
       });
       const result = await response.json();
+
+      // [핵심 수정] Hugging Face 로딩 지연(503) 등 에러 전달
+      if (result.error) {
+        return res.status(400).json({ error: `Hugging Face 오류: ${result.error}` });
+      }
+
       if (Array.isArray(result) && result[0]) {
         const fakeScoreObj = result[0].find(item => item.label === "Fake" || item.label === "LABEL_1");
         aiScore = fakeScoreObj ? Math.round(fakeScoreObj.score * 100) : 0;
       }
     }
 
-    // [DB 업데이트] 성공 시 사용한 글자 수 더하기
+    // 성공 시 글자 수 차감 업데이트
     await supabase.from("licenses").update({ used_chars: used + charCount }).eq("license_key", licenseKey);
 
-    // 결과 반환
     return res.json({ success: true, aiScore, usedChars: used + charCount, dailyLimit: limit });
 
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: "서버 처리 중 오류가 발생했습니다." });
+    return res.status(500).json({ error: "서버 내부 처리 중 오류가 발생했습니다." });
   }
 });
 
