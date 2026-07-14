@@ -11,6 +11,31 @@ app.use(express.json());
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 // 2. 검사 요청을 처리하는 API 엔드포인트
+// [새로 추가할 부분] 로그인 시 라이선스가 진짜인지 확인하는 기능
+app.post("/api/verify", async (req, res) => {
+  const { licenseKey } = req.body;
+  if (!licenseKey) return res.status(400).json({ error: "License key is required." });
+
+  try {
+    const { data: license, error } = await supabase
+      .from("licenses")
+      .select("*")
+      .eq("license_key", licenseKey)
+      .single();
+
+    if (error || !license) {
+      return res.status(401).json({ error: "Invalid license key." });
+    }
+
+    return res.json({
+      success: true,
+      limit: license.daily_limit,
+      used: license.used_chars || 0
+    });
+  } catch (err) {
+    return res.status(500).json({ error: "Server error." });
+  }
+});
 app.post("/api/detect", async (req, res) => {
   const { text, licenseKey, model } = req.body;
 
