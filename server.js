@@ -7,9 +7,10 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Supabase 연결
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// 라이선스 검증 기능
+// [API 1] 라이선스 검증
 app.post("/api/verify", async (req, res) => {
   const { licenseKey } = req.body;
   if (!licenseKey) return res.status(400).json({ error: "라이선스 키가 필요합니다." });
@@ -23,83 +24,78 @@ app.post("/api/verify", async (req, res) => {
 
     if (error || !license) return res.status(401).json({ error: "유효하지 않은 라이선스 키입니다." });
 
-    return res.json({ success: true, limit: license.daily_limit, used: license.used_chars || 0 });
+    return res.json({ 
+      success: true, 
+      limit: license.daily_limit, 
+      used: license.used_chars || 0,
+      role: license.role || 'user' 
+    });
   } catch (err) {
-    return res.status(500).json({ error: "서버 에러가 발생했습니다." });
+    return res.status(500).json({ error: "서버 연결 오류" });
   }
 });
 
-// AI 검사 기능 (에러 처리 완벽 수정)
+// [API 2] AI 텍스트 검사 (Gemini & Groq 전용)
 app.post("/api/detect", async (req, res) => {
   const { text, licenseKey, model } = req.body;
-
-  if (!text || !licenseKey || !model) {
-    return res.status(400).json({ error: "텍스트, 라이선스 키, 모델 선택이 필요합니다." });
-  }
+  if (!text || !licenseKey || !model) return res.status(400).json({ error: "필수 데이터 누락" });
 
   const charCount = text.length;
 
   try {
-    const { data: license, error } = await supabase
-      .from("licenses")
-      .select("*")
-      .eq("license_key", licenseKey)
-      .single();
-
-    if (error || !license) return res.status(401).json({ error: "유효하지 않은 라이선스 키입니다." });
+    const { data: license, error } = await supabase.from("licenses").select("*").eq("license_key", licenseKey).single();
+    if (error || !license) return res.status(401).json({ error: "유효하지 않은 키입니다." });
 
     const limit = license.daily_limit;
     const used = license.used_chars || 0;
+    const role = license.role || 'user';
 
-    if (used + charCount > limit) {
+    // 🚨 한도 차감 제어: 어드민이 아닐 때만 글자 수 초과 검사
+    if (role !== "admin" && (used + charCount > limit)) {
       return res.status(403).json({ error: "일일 글자 수 한도가 초과되었습니다." });
     }
 
     let aiScore = 0;
 
-    if (model === "sapling") {
-      const response = await fetch("https://api.sapling.ai/api/v1/aidetect", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          key: process.env.SAPLING_API_KEY,
-          text: text
-        })
+    // 수학적 기준(Perplexity, Burstiness)을 주입하여 정확도를 극대화한 프롬프트
+    const prompt = `당신은 세계 최고 수준의 AI 텍스트 탐지 전문가입니다. 아래 한국어 텍스트를 분석하여 AI(ChatGPT, Claude 등)가 작성했을 확률을 0부터 100 사이의 정수(%)로 평가하세요.
+    
+    [채점 기준]
+    1. 혼란도(Perplexity): 단어 선택이 예측 가능하고 판에 박힌 어휘인가? (AI 확률 증가) 아니면 창의적이고 예상 밖의 어휘가 섞여 있는가? (사람 확률 증가)
+    2. 변칙성(Burstiness): 문장의 길이가 일정하고 호흡이 비슷한가? (AI 확률 증가) 아니면 아주 짧은 문장과 긴 문장이 불규칙하게 섞여 있는가? (사람 확률 증가)
+    3. 구조적 특징: '첫째, 둘째', '결론적으로' 등 지나치게 정돈된 서론-본론-결론 구조를 가지는가? (AI 확률 증가)
+
+    위 기준을 엄격하게 적용하여 오직 0에서 100 사이의 숫자 하나만 출력하세요. 설명, 기호(%) 등 다른 텍스트는 절대 포함하지 마세요.
+    텍스트: """${text}"""`;
+
+    // 1. Google Gemini
+    if (model === "gemini") {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
       });
       const result = await response.json();
-
-      // [핵심 수정] Sapling에서 에러를 뱉으면 0%로 무시하지 않고 프론트로 에러 전달
-      if (!response.ok || result.error || result.msg) {
-         return res.status(400).json({ error: `Sapling 오류: ${result.error || result.msg || response.statusText}` });
-      }
-      aiScore = Math.round((result.score || 0) * 100);
+      if (result.error) return res.status(400).json({ error: `Gemini 오류: ${result.error.message}` });
+      aiScore = parseInt(result.candidates[0].content.parts[0].text.replace(/[^0-9]/g, '')) || 0;
     } 
-    else if (model === "huggingface") {
-      const response = await fetch("https://api-inference.huggingface.co/models/roberta-base-openai-detector", {
-        headers: { Authorization: `Bearer ${process.env.HUGGINGFACE_API_KEY}` },
-        method: "POST",
-        body: JSON.stringify({ inputs: text }),
+    // 2. Groq Llama 3
+    else if (model === "groq") {
+      const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST", headers: { "Authorization": `Bearer ${process.env.GROQ_API_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "llama3-70b-8192", messages: [{ role: "user", content: prompt }] })
       });
       const result = await response.json();
-
-      // [핵심 수정] Hugging Face 로딩 지연(503) 등 에러 전달
-      if (result.error) {
-        return res.status(400).json({ error: `Hugging Face 오류: ${result.error}` });
-      }
-
-      if (Array.isArray(result) && result[0]) {
-        const fakeScoreObj = result[0].find(item => item.label === "Fake" || item.label === "LABEL_1");
-        aiScore = fakeScoreObj ? Math.round(fakeScoreObj.score * 100) : 0;
-      }
+      if (result.error) return res.status(400).json({ error: `Groq 오류: ${result.error.message}` });
+      aiScore = parseInt(result.choices[0].message.content.replace(/[^0-9]/g, '')) || 0;
     }
 
-    // 성공 시 글자 수 차감 업데이트
+    aiScore = Math.min(100, Math.max(0, aiScore)); 
+    
+    // 검사 성공 시 DB 사용량 업데이트 (어드민이든 유저든 누적 사용량은 기록함)
     await supabase.from("licenses").update({ used_chars: used + charCount }).eq("license_key", licenseKey);
-
     return res.json({ success: true, aiScore, usedChars: used + charCount, dailyLimit: limit });
 
   } catch (err) {
-    console.error(err);
     return res.status(500).json({ error: "서버 내부 처리 중 오류가 발생했습니다." });
   }
 });
