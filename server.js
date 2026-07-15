@@ -9,23 +9,48 @@ app.use(express.json());
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// 1. 라이선스 검증 API
+// 💡 한국 시간(KST) 기준 오늘 날짜 구하기 (예: "2026-07-15")
+const getKSTDate = () => {
+  const now = new Date();
+  const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+  const kst = new Date(utc + (9 * 3600000));
+  return kst.toISOString().split('T')[0]; 
+};
+
+// [API 1] 라이선스 검증
 app.post("/api/verify", async (req, res) => {
   const { licenseKey } = req.body;
   if (!licenseKey) return res.status(400).json({ error: "키가 없습니다." });
   try {
     const { data: license, error } = await supabase.from("licenses").select("*").eq("license_key", licenseKey).single();
     if (error || !license) return res.status(401).json({ error: "유효하지 않은 키" });
-    return res.json({ success: true, limit: license.daily_limit, used: license.used_chars || 0, role: license.role || 'user' });
+
+    // 날짜가 다르면 사용량을 0으로 보여줌
+    let used = license.used_chars || 0;
+    if (license.last_reset_date !== getKSTDate()) used = 0; 
+
+    return res.json({ success: true, limit: license.daily_limit, used, role: license.role || 'user' });
   } catch (err) { return res.status(500).json({ error: err.message }); }
 });
 
-// 2. 앙상블 탐지 API
+// [API 2] 앙상블 탐지 및 자동 리셋
 app.post("/api/detect", async (req, res) => {
   const { text, licenseKey } = req.body;
   try {
     const { data: license } = await supabase.from("licenses").select("*").eq("license_key", licenseKey).single();
     if (!license) return res.status(401).json({ error: "유효하지 않은 키" });
+
+    const today = getKSTDate();
+    let used = license.used_chars || 0;
+
+    // 💡 날짜가 바뀌었으면 사용량을 0으로 강제 초기화
+    if (license.last_reset_date !== today) {
+      used = 0;
+    }
+
+    if (license.role !== "admin" && (used + text.length > license.daily_limit)) {
+      return res.status(403).json({ error: "일일 한도 초과" });
+    }
 
     const prompt = `당신은 언어 통계학자입니다. 텍스트의 Perplexity(혼란도)와 Burstiness(변칙성)를 분석하여 AI 작성 확률(0-100)을 산출하십시오. 숫자 하나만 출력하십시오. 텍스트: """${text}"""`;
 
@@ -46,8 +71,13 @@ app.post("/api/detect", async (req, res) => {
     const groqScore = parseInt(groqRes.choices[0].message.content.replace(/[^0-9]/g, '')) || 0;
     const finalScore = Math.round((geminiScore + groqScore) / 2);
 
-    await supabase.from("licenses").update({ used_chars: license.used_chars + text.length }).eq("license_key", licenseKey);
-    return res.json({ success: true, aiScore: finalScore });
+    // 💡 DB 업데이트: 글자수 증가 + 오늘 날짜로 갱신
+    await supabase.from("licenses").update({ 
+      used_chars: used + text.length,
+      last_reset_date: today 
+    }).eq("license_key", licenseKey);
+
+    return res.json({ success: true, aiScore: finalScore, updatedUsed: used + text.length });
   } catch (err) {
     return res.status(500).json({ error: "탐지 서버 오류" });
   }
