@@ -5,16 +5,18 @@ const fetch = require("node-fetch");
 const multer = require("multer");
 const fs = require("fs");
 const { exec } = require("child_process");
+const WebSocket = require("ws"); // 💡 1. ws 모듈 불러오기
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 임시 파일 업로드 경로 설정 (Render 서버 환경 맞춤)
 const upload = multer({ dest: '/tmp/uploads/' }); 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+// 💡 2. createClient 초기화 시 transport 옵션 추가
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+  realtime: { transport: WebSocket }
+});
 
-// 한국 시간 기준 날짜 반환 함수
 const getKSTDate = () => {
   const now = new Date();
   const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
@@ -22,39 +24,29 @@ const getKSTDate = () => {
   return kst.toISOString().split('T')[0]; 
 };
 
-// [API 1] 라이선스 검증 및 상태 조회
 app.post("/api/verify", async (req, res) => {
   const { licenseKey } = req.body;
   if (!licenseKey) return res.status(400).json({ error: "키가 없습니다." });
   try {
     const { data: license, error } = await supabase.from("licenses").select("*").eq("license_key", licenseKey).single();
     if (error || !license) return res.status(401).json({ error: "유효하지 않은 키" });
-
-    // 날짜가 다르면 사용량을 0으로 처리 (DB 갱신은 사용 시점에 수행)
     let used = license.used_chars || 0;
     if (license.last_reset_date !== getKSTDate()) used = 0; 
-
     return res.json({ success: true, limit: license.daily_limit, used, role: license.role || 'user' });
   } catch (err) { return res.status(500).json({ error: err.message }); }
 });
 
-// [API 2] AI 텍스트 탐지기 (Gemini 문맥 분석 + Groq 로그 확률 수학 공식)
 app.post("/api/detect", async (req, res) => {
   const { text, licenseKey } = req.body;
   try {
-    // 라이선스 및 한도 체크
     const { data: license } = await supabase.from("licenses").select("*").eq("license_key", licenseKey).single();
     if (!license) return res.status(401).json({ error: "유효하지 않은 키" });
-
     const today = getKSTDate();
     let used = license.used_chars || 0;
     if (license.last_reset_date !== today) used = 0;
-
     if (license.role !== "admin" && (used + text.length > license.daily_limit)) {
       return res.status(403).json({ error: "일일 한도 초과" });
     }
-
-    // --- 엔진 1. Gemini: 문맥 파악 및 스팸(테러) 방어 ---
     const geminiPrompt = `당신은 보조 텍스트 판독기입니다.
     1. 'ㅇㅇㅇ', 'ㅋㅋㅋㅋ' 등 의미 없는 반복은 0점 처리
     2. 사람의 구어체, 일기 형식이면 0~20점 처리
@@ -66,22 +58,16 @@ app.post("/api/detect", async (req, res) => {
       body: JSON.stringify({ contents: [{ parts: [{ text: geminiPrompt }] }], generationConfig: { temperature: 0 } })
     });
 
-    // --- 엔진 2. Groq (Llama): 확률 분포(Logprobs) 수학 공식 분석 ---
     const groqReq = fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST", headers: { "Authorization": `Bearer ${process.env.GROQ_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: "llama-3.3-70b-versatile",
         messages: [{ role: "user", content: `다음 텍스트의 확률 분포를 분석하기 위해 그대로 똑같이 따라 쓰십시오: """${text}"""` }],
-        temperature: 0,
-        logprobs: true,
-        top_logprobs: 1,
-        max_tokens: 150
+        temperature: 0, logprobs: true, top_logprobs: 1, max_tokens: 150
       })
     });
 
     const [geminiRes, groqRes] = await Promise.all([geminiReq.then(r => r.json()), groqReq.then(r => r.json())]);
-
-    // Gemini 점수 추출
     let geminiScore = 50; 
     try {
       const gText = geminiRes.candidates[0]?.content?.parts[0]?.text || "";
@@ -89,65 +75,33 @@ app.post("/api/detect", async (req, res) => {
       geminiScore = match ? parseInt(match[1]) : (gText.match(/\d+/g) ? parseInt(gText.match(/\d+/g).pop()) : 50);
       geminiScore = Math.min(100, Math.max(0, geminiScore));
     } catch(e) {}
-
-    // Groq 수식 기반 점수 산출
     let groqMathScore = 50;
     try {
       if (groqRes.choices && groqRes.choices[0].logprobs && groqRes.choices[0].logprobs.content) {
         const logProbs = groqRes.choices[0].logprobs.content.map(c => c.logprob);
-        
         if (logProbs.length > 0) {
           const avgLogProb = logProbs.reduce((a, b) => a + b, 0) / logProbs.length;
           const perplexity = Math.exp(-avgLogProb); 
           const variance = logProbs.reduce((a, b) => a + Math.pow(b - avgLogProb, 2), 0) / logProbs.length;
-
-          if (perplexity < 50) {
-            groqMathScore = Math.min(100, Math.floor((50 - perplexity) * 2 + (1 - Math.abs(variance)) * 50));
-          } else {
-            groqMathScore = Math.max(0, Math.floor(20 - (perplexity - 50)));
-          }
+          if (perplexity < 50) groqMathScore = Math.min(100, Math.floor((50 - perplexity) * 2 + (1 - Math.abs(variance)) * 50));
+          else groqMathScore = Math.max(0, Math.floor(20 - (perplexity - 50)));
         }
       }
     } catch(e) {}
-
-    // 최종 앙상블 로직 결합
-    let finalScore = 0;
-    if (geminiScore < 10 && text.replace(/\s/g, '').length < 30) {
-      finalScore = Math.floor(Math.random() * 5); // 짧은 스팸글 차단
-    } else {
-      finalScore = Math.round((geminiScore + groqMathScore) / 2);
-    }
-
-    // DB 업데이트: 글자 수 차감 및 날짜 갱신
+    let finalScore = (geminiScore < 10 && text.replace(/\s/g, '').length < 30) ? Math.floor(Math.random() * 5) : Math.round((geminiScore + groqMathScore) / 2);
     await supabase.from("licenses").update({ used_chars: used + text.length, last_reset_date: today }).eq("license_key", licenseKey);
     return res.json({ success: true, aiScore: finalScore, updatedUsed: used + text.length });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "탐지 서버 오류" });
-  }
+  } catch (err) { console.error(err); return res.status(500).json({ error: "탐지 서버 오류" }); }
 });
 
-// [API 3] PDF 강력 압축기 (자체 서버 Ghostscript 엔진 적용)
 app.post("/api/compress", upload.single("pdf"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "파일이 없습니다." });
-  
   const inputPath = req.file.path;
   const outputPath = `${req.file.path}_compressed.pdf`;
-
-  // Ghostscript 압축 옵션 설정 (/ebook 옵션을 사용하여 해상도 및 용량 대폭 압축)
   const gsCommand = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dNOPAUSE -dQUIET -dBATCH -sOutputFile=${outputPath} ${inputPath}`;
-
   exec(gsCommand, (error, stdout, stderr) => {
-    if (error) {
-      console.error("Ghostscript 압축 에러:", error);
-      // 작업 실패 시 찌꺼기 파일 삭제
-      if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath); 
-      return res.status(500).json({ error: "PDF 압축 중 서버 내부 오류가 발생했습니다." });
-    }
-
-    // 압축 완료 파일 클라이언트로 전송
+    if (error) { if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath); return res.status(500).json({ error: "압축 실패" }); }
     res.download(outputPath, `compressed_${req.file.originalname}`, (err) => {
-      // 전송 성공 여부와 관계없이 서버 저장 공간 확보를 위해 즉시 파일 삭제
       if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
       if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
     });
