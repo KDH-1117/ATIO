@@ -1,5 +1,5 @@
-# 1. 가벼운 Node.js 환경(리눅스)을 가져옵니다.
-FROM node:18-bullseye-slim
+# 1. Supabase 권장에 맞춰 최신 Node 20 버전으로 업데이트
+FROM node:20-bullseye-slim
 
 # 2. 리눅스 서버에 Ghostscript(PDF 압축 엔진)를 설치합니다.
 RUN apt-get update && apt-get install -y ghostscript && rm -rf /var/lib/apt/lists/*
